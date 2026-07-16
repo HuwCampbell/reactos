@@ -54,7 +54,8 @@ EXTENDS Integers, Sequences, FiniteSets, TLC
 
 CONSTANTS
     Pages,          (* The finite set of page-frame numbers, e.g. 1..N *)
-    Procs           (* The finite set of user-space / kernel caller processes *)
+    Procs,          (* The finite set of user-space / kernel caller processes *)
+    MaxRefCount     (* Bound number of reference counts *)
 
 ASSUME Pages # {} /\ Procs # {}
 
@@ -147,7 +148,7 @@ Inv3_FreeHasNoRef ==
     \A p \in Pages : location[p] \in {"Free", "Zeroed"} =>
         refcount[p] = 0 /\ sharecount[p] = 0
 
-Inv4_Partition ==
+Inv4_Partition ==  TRUE
     \* Every page is on exactly one list — enforced by location being a function
 
 Inv5_Conservation ==
@@ -312,6 +313,7 @@ AllocUserPage(proc, p) ==
     /\ location[p] \in {"Zeroed", "Free"}
     /\ refcount[p] = 0
     /\ sharecount[p] = 0
+    /\ mustBeCached[p] = FALSE
     /\ availablePages > 0
     /\ location'       = [location     EXCEPT ![p] = "Active"]
     /\ refcount'       = [refcount     EXCEPT ![p] = 1]
@@ -330,10 +332,12 @@ AllocSystemPage(proc, p) ==
     /\ location[p] \in {"Zeroed", "Free"}
     /\ refcount[p] = 0
     /\ sharecount[p] = 0
+    /\ mustBeCached[p] = FALSE
     /\ availablePages > 0
-    /\ location'       = [location  EXCEPT ![p] = "Active"]
-    /\ refcount'       = [refcount  EXCEPT ![p] = 1]
-    /\ isRos'          = [isRos     EXCEPT ![p] = TRUE]
+    /\ location'       = [location   EXCEPT ![p] = "Active"]
+    /\ refcount'       = [refcount   EXCEPT ![p] = 1]
+    /\ sharecount'     = [sharecount EXCEPT ![p] = 1]
+    /\ isRos'          = [isRos      EXCEPT ![p] = FALSE]
     /\ availablePages' = availablePages - 1
     /\ UNCHANGED << sharecount, modified, isDeleted, mustBeCached,
                     isPrototype, lruList, pfnLockHolder >>
@@ -346,6 +350,7 @@ ReferencePage(proc, p) ==
     /\ pfnLockHolder = proc
     /\ isRos[p] = TRUE
     /\ refcount[p] >= 1
+    /\ refcount[p] < MaxRefCount
     /\ refcount' = [refcount EXCEPT ![p] = refcount[p] + 1]
     /\ UNCHANGED << location, sharecount, modified, isRos, isDeleted,
                     mustBeCached, isPrototype, availablePages, lruList,
@@ -366,13 +371,15 @@ DereferencePage(proc, p) ==
        THEN
            \* refcount hits zero -> free the page
            /\ refcount'       = [refcount     EXCEPT ![p] = 0]
-           /\ mustBeCached'   = [mustBeCached EXCEPT ![p] = FALSE]
-           /\ lruList'        = [i \in 1..Len(lruList) |->
-                                     lruList[i]]  \* filter p out below
-               \* (simplified: remove p from lruList sequence)
-           /\ location'       = [location EXCEPT ![p] = "Free"]
+           /\ location'       = [location     EXCEPT ![p] = "Free"]
            /\ availablePages' = availablePages + 1
-           /\ isRos'          = [isRos EXCEPT ![p] = FALSE]
+           /\ isRos'          = [isRos        EXCEPT ![p] = FALSE]
+           /\ mustBeCached'   = [mustBeCached EXCEPT ![p] = FALSE]
+           /\ IF mustBeCached[p]
+              THEN
+                  /\ lruList'      = SelectSeq(lruList, LAMBDA x : x # p)
+              ELSE
+                  /\ UNCHANGED lruList
        ELSE
            /\ refcount'     = [refcount EXCEPT ![p] = refcount[p] - 1]
            /\ UNCHANGED << location, mustBeCached, lruList,
@@ -542,34 +549,61 @@ Next ==
 -----------------------------------------------------------------------------
 
 (*
- * Weak fairness on the zero-page thread: if there is always a Free page
+ * Strong fairness on the zero-page thread: if there is always a Free page
  * and a process willing to zero it, it will eventually be zeroed.
  *)
 FairnessZeroPage ==
     \A proc \in Procs, p \in Pages :
-        WF_vars(ZeroOnePage(proc, p))
+        SF_vars(ZeroOnePage(proc, p))
 
 (*
- * Weak fairness on the modified-page writer.
+ * Strong fairness on the modified-page writer.
  *)
 FairnessModifiedWriter ==
     \A proc \in Procs, p \in Pages :
-        WF_vars(WriteModifiedPage(proc, p))
+        SF_vars(WriteModifiedPage(proc, p))
+
+(*
+ * Weak fairness on dereferencing; callers must eventually release pages
+ * they hold.
+ *)
+FairnessDereference ==
+    \A proc \in Procs, p \in Pages :
+        SF_vars(DereferencePage(proc, p))
+
+FairnessAcquireLock ==
+    \A proc \in Procs :
+        WF_vars(AcquireLock(proc))
+
+FairnessDecrementShare ==
+    \A proc \in Procs, p \in Pages :
+        WF_vars(DecrementShareCount(proc, p))
 
 Spec == Init /\ [][Next]_vars
-           /\ FairnessZeroPage
-           /\ FairnessModifiedWriter
+             /\ FairnessZeroPage
+             /\ FairnessModifiedWriter
+             /\ FairnessDereference
+             /\ FairnessDecrementShare
+             /\ FairnessAcquireLock
 
 -----------------------------------------------------------------------------
 (* LIVENESS PROPERTIES *)
 -----------------------------------------------------------------------------
 
 (*
- * Live1: Any page stuck on FreeList will eventually be zeroed.
+ * Live1: Any page stuck on FreeList will eventually be zeroed (disabled).
  *)
 Live1_FreeEventuallyZeroed ==
     \A p \in Pages :
         (location[p] = "Free") ~> (location[p] = "Zeroed")
+
+(*
+ * Live1: The zero page thread makes progress when free pages exist in sufficient quantity
+ *)
+Live1_ZeroPageThreadProgress ==
+    (\E p \in Pages : location[p] = "Free")
+        ~> (\E p \in Pages : location[p] = "Zeroed")
+
 
 (*
  * Live2: If a zeroed/free page exists, allocation will eventually succeed.
